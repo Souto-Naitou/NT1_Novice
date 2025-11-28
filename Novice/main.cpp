@@ -26,7 +26,7 @@
 #pragma comment(lib, "ixwebsocket.lib")
 
 using json = nlohmann::json;
-const char kWindowTitle[] = "DUMMY";
+const char kWindowTitle[] = "LE3B_20_ナイトウ_ソウト";
 
 // 設定
 namespace Config {
@@ -599,7 +599,7 @@ int32_t WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int32_t) {
 	char keys[256] = {0};
 	char previousKeys[256] = {0};
 
-	std::string displayUserName = "完璧で究極の"; // 表示用ユーザ名
+	std::string displayUserName = "世界に一つだけの"; // 表示用ユーザ名
 	char chatInputBuf[256] = "";              // 【追加】チャット入力バッファ
 
 	// ixwebsocket 初期化
