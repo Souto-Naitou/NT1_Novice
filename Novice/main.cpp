@@ -26,14 +26,14 @@
 #pragma comment(lib, "ixwebsocket.lib")
 
 using json = nlohmann::json;
-const char kWindowTitle[] = "LE3B_20_ナイトウ_ソウト";
+const char kWindowTitle[] = "DUMMY";
 
 // 設定
 namespace Config {
 // Supabase Realtime WebSocket の URLプロジェクト固有のエンドポイント
 const std::string kSupabaseUrl = "wss://oolchvtzizhmniggcaiw.supabase.co/realtime/v1/websocket"
                                  "?apikey=sb_publishable_kcL7fFe5hC-ruqdcW0Yjdg_lsRXWu3J&vsn=1.0.0";
-// Phoenix チャンネルのトピック（例: public:messages）
+// Phoenix チャンネルのトピック
 const std::string kTopic = "realtime:public:messages";
 // 認証トークン（ここでは publishable key を使用）実運用では認証済みトークン
 const std::string kUserToken = "sb_publishable_kcL7fFe5hC-ruqdcW0Yjdg_lsRXWu3J";
@@ -49,8 +49,7 @@ bool IsUUID(const std::string& candidate) {
 	if (candidate.length() != 36) {
 		return false;
 	}
-	if (
-	  candidate[8] != '-' || candidate[13] != '-' || candidate[18] != '-' || candidate[23] != '-') {
+	if (candidate[8] != '-' || candidate[13] != '-' || candidate[18] != '-' || candidate[23] != '-') {
 		return false;
 	}
 	return true;
@@ -118,6 +117,22 @@ std::string MakePresenceTrackMessage(const std::string& topic, const std::string
 
 	return jsonObject.dump();
 }
+
+// チャットメッセージ生成（Broadcast）
+std::string MakeChatMessage(const std::string& topic, const std::string& userName, const std::string& message) {
+	json jsonObject;
+	jsonObject["topic"] = topic;
+	jsonObject["event"] = "broadcast"; // 全員に配信するイベント
+	jsonObject["ref"] = "chat_1";
+
+	// Broadcast用のPayload構造
+	jsonObject["payload"]["type"] = "broadcast";
+	jsonObject["payload"]["event"] = "chat_message"; // イベント名
+	jsonObject["payload"]["payload"]["user_name"] = userName;
+	jsonObject["payload"]["payload"]["message"] = message;
+
+	return jsonObject.dump();
+}
 } // namespace MessageFactory
 
 // Presence 関連データ構造
@@ -136,7 +151,7 @@ struct PresenceEntry {
 
 // Presence 管理クラス（スレッド安全）
 class PresenceManager {
-  public:
+public:
 	// ユーザ追加既存なら無操作
 	void AddUser(const std::string& uniqueId, const std::string& userName, int32_t frame) {
 		std::lock_guard<std::mutex> lock(mutex_);
@@ -168,8 +183,7 @@ class PresenceManager {
 				displayName = iterator->second.userName;
 			}
 
-			std::string logMessage =
-			  "[" + Utils::GetCurrentTimeLocal() + "] " + displayName + " left";
+			std::string logMessage = "[" + Utils::GetCurrentTimeLocal() + "] " + displayName + " left";
 			AddActivityMessage(logMessage);
 
 			users_.erase(iterator);
@@ -195,7 +209,7 @@ class PresenceManager {
 		return activityMessages_;
 	}
 
-  private:
+private:
 	mutable std::mutex mutex_; // const メソッドからのロック用
 	std::map<std::string, PresenceUser> users_;
 	std::vector<std::string> activityMessages_;
@@ -210,9 +224,47 @@ class PresenceManager {
 	}
 };
 
+// チャット関連データ構造と管理クラス
+struct ChatEntry {
+	std::string userName;
+	std::string message;
+	std::string timeStr;
+};
+
+class ChatManager {
+public:
+	void AddMessage(const std::string& userName, const std::string& message) {
+		std::lock_guard<std::mutex> lock(mutex_);
+		ChatEntry entry;
+		entry.userName = userName;
+		entry.message = message;
+		entry.timeStr = Utils::GetCurrentTimeLocal();
+		messages_.push_back(entry);
+
+		// 履歴上限（例：50件）
+		if (messages_.size() > 50) {
+			messages_.erase(messages_.begin());
+		}
+	}
+
+	void Clear() {
+		std::lock_guard<std::mutex> lock(mutex_);
+		messages_.clear();
+	}
+
+	std::vector<ChatEntry> GetMessages() const {
+		std::lock_guard<std::mutex> lock(mutex_);
+		return messages_;
+	}
+
+private:
+	mutable std::mutex mutex_;
+	std::vector<ChatEntry> messages_;
+};
+
 // Realtime 接続状態クラス
 class RealtimeConnectionState {
-  public:
+public:
 	enum class Status { Idle, Connecting, Connected, Error, Closed };
 
 	struct Snapshot {
@@ -266,7 +318,7 @@ class RealtimeConnectionState {
 		return snapshot;
 	}
 
-  private:
+private:
 	mutable std::mutex mutex_;
 	Status status_ = Status::Idle;
 	bool joined_ = false;
@@ -278,9 +330,7 @@ class RealtimeConnectionState {
 // JSON パースヘルパ
 namespace PresenceParser {
 // presence_diff の解析joins/leaves を出力する変化有無を返す
-bool ParsePresenceDiff(
-  const std::string& jsonString, std::vector<PresenceEntry>& outJoins,
-  std::vector<PresenceEntry>& outLeaves) {
+bool ParsePresenceDiff(const std::string& jsonString, std::vector<PresenceEntry>& outJoins, std::vector<PresenceEntry>& outLeaves) {
 	if (!nlohmann::json::accept(jsonString)) {
 		return false;
 	}
@@ -358,6 +408,30 @@ void ParsePresenceState(const std::string& jsonString, std::vector<PresenceEntry
 			}
 		}
 	}
+}
+
+// チャットメッセージのパース
+bool ParseChatMessage(const std::string& jsonString, ChatEntry& outEntry) {
+	if (!nlohmann::json::accept(jsonString)) {
+		return false;
+	}
+	json parsedJson = json::parse(jsonString, nullptr, false);
+
+	// Broadcastイベントかつ、chat_messageであることを確認
+	if (parsedJson.value("event", "") == "broadcast") {
+		if (parsedJson.contains("payload")) {
+			json payload = parsedJson["payload"];
+			if (payload.value("event", "") == "chat_message" && payload.contains("payload")) {
+				json data = payload["payload"];
+				if (data.contains("user_name") && data.contains("message")) {
+					outEntry.userName = data["user_name"].get<std::string>();
+					outEntry.message = data["message"].get<std::string>();
+					return true;
+				}
+			}
+		}
+	}
+	return false;
 }
 } // namespace PresenceParser
 
@@ -463,6 +537,40 @@ void DrawPresenceInfo(const PresenceManager& presenceManager) {
 	}
 	ImGui::EndChild();
 }
+
+bool DrawChatWindow(const ChatManager& chatManager, char* inputBuf) {
+	// まずは考えてみよう
+	ImGuiWindowFlags windowFlag = ImGuiWindowFlags_NoResize;
+	bool triggered = false;
+	ImGui::SetNextWindowSize({ -1, -1 });
+	bool isWindowOpen = ImGui::Begin("Chat", nullptr, windowFlag);
+	if (isWindowOpen) {
+		static bool autoScroll = true;
+		ImGui::Checkbox("Auto Scroll", &autoScroll);
+		
+		// チャット履歴表示領域
+		auto flag = ImGuiChildFlags_Border | ImGuiChildFlags_AlwaysUseWindowPadding;
+		if (ImGui::BeginChild("##chatwnd", ImVec2(300.0f, 400.0f), flag))
+		{
+			for (const auto& chatEntry : chatManager.GetMessages()) {
+				std::string chatUserName = chatEntry.userName;
+				if (chatUserName.empty()) {
+					chatUserName = "風吹けば名無し";
+				}
+				ImGui::TextWrapped("[%s] %s: %s", chatEntry.timeStr.c_str(), chatUserName.c_str(), chatEntry.message.c_str());
+			}
+			if (autoScroll)
+				ImGui::SetScrollHereY(1.0f);
+			ImGui::EndChild();
+		}
+
+		ImGui::InputText("Message", inputBuf, 256);
+		ImGui::SameLine();
+		triggered = ImGui::Button("Send");
+	}
+	return triggered;
+}
+
 } // namespace UI
 
 // メイン関数：WinMain
@@ -475,8 +583,7 @@ int32_t WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int32_t) {
 	ImGuiIO& io = ImGui::GetIO();
 	io.Fonts->Clear(); // 既存フォントクリア
 
-	ImFont* loadedFont = io.Fonts->AddFontFromFileTTF(
-	  "C:/Windows/Fonts/meiryo.ttc", 18.0f, NULL, io.Fonts->GetGlyphRangesJapanese());
+	ImFont* loadedFont = io.Fonts->AddFontFromFileTTF("C:/Windows/Fonts/meiryo.ttc", 18.0f, NULL, io.Fonts->GetGlyphRangesJapanese());
 
 	if (loadedFont == NULL) {
 		OutputDebugStringA("Failed to load Japanese font, using default");
@@ -492,12 +599,14 @@ int32_t WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int32_t) {
 	char keys[256] = {0};
 	char previousKeys[256] = {0};
 
-	std::string displayUserName = "これなんて読むん->"; // 表示用ユーザ名
+	std::string displayUserName = "完璧で究極の"; // 表示用ユーザ名
+	char chatInputBuf[256] = "";              // 【追加】チャット入力バッファ
 
 	// ixwebsocket 初期化
 	ix::initNetSystem();
 	RealtimeConnectionState connectionState;
 	PresenceManager presenceManager;
+	ChatManager chatManager;
 
 	std::unique_ptr<ix::WebSocket> webSocketPtr;
 	uint32_t currentFrame = 0;
@@ -511,6 +620,7 @@ int32_t WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int32_t) {
 			webSocketPtr.reset();
 		}
 		presenceManager.Clear();
+		chatManager.Clear();
 		presenceTrackSent = false;
 
 		webSocketPtr = std::make_unique<ix::WebSocket>();
@@ -521,8 +631,7 @@ int32_t WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int32_t) {
 			if (messagePtr->type == ix::WebSocketMessageType::Open) {
 				OutputDebugStringA("WS OPEN");
 				connectionState.SetStatus(RealtimeConnectionState::Status::Connected);
-				std::string joinMessage =
-				  MessageFactory::MakeJoinMessage(Config::kTopic, Config::kUserToken);
+				std::string joinMessage = MessageFactory::MakeJoinMessage(Config::kTopic, Config::kUserToken);
 				webSocketPtr->sendText(joinMessage);
 
 			} else if (messagePtr->type == ix::WebSocketMessageType::Message) {
@@ -535,8 +644,7 @@ int32_t WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int32_t) {
 					if (receivedText.find("\"ref\":\"1\"") != std::string::npos) {
 						connectionState.SetJoined(true);
 						if (!presenceTrackSent) {
-							std::string presenceMessage = MessageFactory::MakePresenceTrackMessage(
-							  Config::kTopic, displayUserName);
+							std::string presenceMessage = MessageFactory::MakePresenceTrackMessage(Config::kTopic, displayUserName);
 							webSocketPtr->sendText(presenceMessage);
 							presenceTrackSent = true;
 						}
@@ -549,26 +657,28 @@ int32_t WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int32_t) {
 					std::vector<PresenceEntry> parsedEntries;
 					PresenceParser::ParsePresenceState(receivedText, parsedEntries);
 					for (const auto& entry : parsedEntries) {
-						presenceManager.AddUser(
-						  entry.uniqueId, entry.userName, static_cast<int32_t>(currentFrame));
+						presenceManager.AddUser(entry.uniqueId, entry.userName, static_cast<int32_t>(currentFrame));
 					}
 				}
 
 				if (receivedText.find("presence_diff") != std::string::npos) {
 					std::vector<PresenceEntry> joinEntries;
 					std::vector<PresenceEntry> leaveEntries;
-					bool hasChanges =
-					  PresenceParser::ParsePresenceDiff(receivedText, joinEntries, leaveEntries);
+					bool hasChanges = PresenceParser::ParsePresenceDiff(receivedText, joinEntries, leaveEntries);
 					if (hasChanges) {
 						for (const auto& joinEntry : joinEntries) {
-							presenceManager.AddUser(
-							  joinEntry.uniqueId, joinEntry.userName,
-							  static_cast<int32_t>(currentFrame));
+							presenceManager.AddUser(joinEntry.uniqueId, joinEntry.userName, static_cast<int32_t>(currentFrame));
 						}
 						for (const auto& leaveEntry : leaveEntries) {
 							presenceManager.RemoveUser(leaveEntry.uniqueId, leaveEntry.userName);
 						}
 					}
+				}
+
+				if (receivedText.find("broadcast") && receivedText.find("chat_message")) {
+					ChatEntry newChatMessage;
+					PresenceParser::ParseChatMessage(receivedText, newChatMessage);
+					chatManager.AddMessage(newChatMessage.userName, newChatMessage.message);
 				}
 
 			} else if (messagePtr->type == ix::WebSocketMessageType::Error) {
@@ -594,8 +704,7 @@ int32_t WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int32_t) {
 
 		// ハートビート送信判定join 済みかつ所定フレーム経過で送信
 		if (webSocketPtr && snapshot.joined) {
-			int32_t frameDifference =
-			  static_cast<int32_t>(currentFrame) - snapshot.lastHeartbeatSentFrame;
+			int32_t frameDifference = static_cast<int32_t>(currentFrame) - snapshot.lastHeartbeatSentFrame;
 			if (frameDifference >= Config::kHeartbeatIntervalFrames) {
 				webSocketPtr->sendText(MessageFactory::MakeHeartbeatMessage());
 				connectionState.RecordHeartbeatSent(static_cast<int32_t>(currentFrame));
@@ -603,19 +712,33 @@ int32_t WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int32_t) {
 		}
 
 #ifdef USE_IMGUI
+		// 元々の「Status」ウィンドウ（Heartbeat, Presence含む）
 		ImGui::Begin("Status");
 		if (ImGui::Button("Connect")) {
 			StartWebSocket();
 		}
 		ImGui::SameLine();
-		ImGui::Text("Name: %s", displayUserName.c_str());
+
 		UI::DrawConnectionStatus(snapshot);
 		if (snapshot.status == RealtimeConnectionState::Status::Connected) {
 			UI::DrawJoinStatus(snapshot.joined);
+			// Heartbeat
 			UI::DrawHeartbeatStatus(static_cast<int32_t>(currentFrame), snapshot);
+			// Presence (元のサイズで表示)
 			UI::DrawPresenceInfo(presenceManager);
 		}
-		ImGui::End();
+		ImGui::End(); // Status Window End
+
+		// チャットウィンドウ
+		if (UI::DrawChatWindow(chatManager, chatInputBuf)) {
+			// 送信ボタン押下時
+			if (snapshot.joined) {
+				std::string chatMessage = MessageFactory::MakeChatMessage(Config::kTopic, displayUserName, chatInputBuf);
+				webSocketPtr->sendText(chatMessage);
+				chatManager.AddMessage(displayUserName, chatInputBuf);
+				chatInputBuf[0] = '\0'; // 送信後クリア
+			}
+		}
 #endif
 
 		Novice::EndFrame();
