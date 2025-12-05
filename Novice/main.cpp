@@ -12,6 +12,10 @@
 #include <vector>
 #include <windows.h>
 
+#include <unordered_set>
+#define UUID_SYSTEM_GENERATOR
+#include "../external/uuid/uuid.h"
+
 #include "../external/nlohmann/json.hpp"
 
 #include <Novice.h>
@@ -118,18 +122,26 @@ std::string MakePresenceTrackMessage(const std::string& topic, const std::string
 	return jsonObject.dump();
 }
 
+struct ChatMessagePayload  {
+	std::string topic;
+	std::string userName;
+	std::string message;
+	std::string messageId;
+};
+
 // チャットメッセージ生成（Broadcast）
-std::string MakeChatMessage(const std::string& topic, const std::string& userName, const std::string& message) {
+std::string MakeChatMessage(const ChatMessagePayload& payload) {
 	json jsonObject;
-	jsonObject["topic"] = topic;
+	jsonObject["topic"] = payload.topic;
 	jsonObject["event"] = "broadcast"; // 全員に配信するイベント
 	jsonObject["ref"] = "chat_1";
 
 	// Broadcast用のPayload構造
 	jsonObject["payload"]["type"] = "broadcast";
 	jsonObject["payload"]["event"] = "chat_message"; // イベント名
-	jsonObject["payload"]["payload"]["user_name"] = userName;
-	jsonObject["payload"]["payload"]["message"] = message;
+	jsonObject["payload"]["payload"]["user_name"] = payload.userName;
+	jsonObject["payload"]["payload"]["message"] = payload.message;
+	jsonObject["payload"]["payload"]["message_id"] = payload.messageId;
 
 	return jsonObject.dump();
 }
@@ -226,6 +238,7 @@ private:
 
 // チャット関連データ構造と管理クラス
 struct ChatEntry {
+	std::string messageId;
 	std::string userName;
 	std::string message;
 	std::string timeStr;
@@ -233,11 +246,16 @@ struct ChatEntry {
 
 class ChatManager {
 public:
-	void AddMessage(const std::string& userName, const std::string& message) {
+	void AddMessage(const std::string& userName, const std::string& message, const std::string messageId) {
 		std::lock_guard<std::mutex> lock(mutex_);
+		if (seenMessageIds_.find(messageId) != seenMessageIds_.end()) {
+			return; // 既に存在するメッセージIDなら無視
+		}
+
 		ChatEntry entry;
 		entry.userName = userName;
 		entry.message = message;
+		entry.messageId = messageId;
 		entry.timeStr = Utils::GetCurrentTimeLocal();
 		messages_.push_back(entry);
 
@@ -260,6 +278,7 @@ public:
 private:
 	mutable std::mutex mutex_;
 	std::vector<ChatEntry> messages_;
+	std::unordered_set<std::string> seenMessageIds_; // 重複防止用 ID 集合
 };
 
 // Realtime 接続状態クラス
@@ -423,9 +442,10 @@ bool ParseChatMessage(const std::string& jsonString, ChatEntry& outEntry) {
 			json payload = parsedJson["payload"];
 			if (payload.value("event", "") == "chat_message" && payload.contains("payload")) {
 				json data = payload["payload"];
-				if (data.contains("user_name") && data.contains("message")) {
+				if (data.contains("user_name") && data.contains("message") && data.contains("message_id")) {
 					outEntry.userName = data["user_name"].get<std::string>();
 					outEntry.message = data["message"].get<std::string>();
+					outEntry.messageId = data["message_id"].get<std::string>();
 					return true;
 				}
 			}
@@ -557,7 +577,14 @@ bool DrawChatWindow(const ChatManager& chatManager, char* inputBuf) {
 				if (chatUserName.empty()) {
 					chatUserName = "風吹けば名無し";
 				}
-				ImGui::TextWrapped("[%s] %s: %s", chatEntry.timeStr.c_str(), chatUserName.c_str(), chatEntry.message.c_str());
+				std::string shortMessageId;
+				const std::string id = chatEntry.messageId;
+				if (id.length() > 8) {
+					shortMessageId = id.substr(0, 8) + "...";
+				} else {
+					shortMessageId = id;
+				}
+				ImGui::TextWrapped("[%s](%s) %s: %s", chatEntry.timeStr.c_str(), shortMessageId.c_str(), chatUserName.c_str(), chatEntry.message.c_str());
 			}
 			if (autoScroll)
 				ImGui::SetScrollHereY(1.0f);
@@ -675,10 +702,11 @@ int32_t WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int32_t) {
 					}
 				}
 
-				if (receivedText.find("broadcast") && receivedText.find("chat_message")) {
+				if (receivedText.find("broadcast") != std::string::npos && 
+					receivedText.find("chat_message") != std::string::npos) {
 					ChatEntry newChatMessage;
 					PresenceParser::ParseChatMessage(receivedText, newChatMessage);
-					chatManager.AddMessage(newChatMessage.userName, newChatMessage.message);
+					chatManager.AddMessage(newChatMessage.userName, newChatMessage.message, newChatMessage.messageId);
 				}
 
 			} else if (messagePtr->type == ix::WebSocketMessageType::Error) {
@@ -733,9 +761,15 @@ int32_t WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int32_t) {
 		if (UI::DrawChatWindow(chatManager, chatInputBuf)) {
 			// 送信ボタン押下時
 			if (snapshot.joined) {
-				std::string chatMessage = MessageFactory::MakeChatMessage(Config::kTopic, displayUserName, chatInputBuf);
+				MessageFactory::ChatMessagePayload payload;
+				payload.topic = Config::kTopic;
+				payload.userName = displayUserName;
+				payload.message = chatInputBuf;
+				payload.messageId = uuids::to_string(uuids::uuid_system_generator{}());
+
+				std::string chatMessage = MessageFactory::MakeChatMessage(payload);
 				webSocketPtr->sendText(chatMessage);
-				chatManager.AddMessage(displayUserName, chatInputBuf);
+				chatManager.AddMessage(payload.userName, payload.message, payload.messageId);
 				chatInputBuf[0] = '\0'; // 送信後クリア
 			}
 		}
